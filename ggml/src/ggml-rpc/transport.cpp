@@ -573,7 +573,7 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
                 int rarc = rdma_resolve_addr(cm_id, nullptr,
                                       reinterpret_cast<sockaddr *>(&remote_addr),
                                       2000 /* ms */);
-                GGML_LOG_INFO("RDMA cm: bind=skipped resolve_addr=%s\n",
+                GGML_LOG_DEBUG("RDMA cm: bind=skipped resolve_addr=%s\n",
                               rarc == 0 ? "ok" : (rarc < 0 ? strerror(errno) : "async"));
                 if (rarc == 0) {
                     // Wait for RDMA_CM_EVENT_ADDR_RESOLVED — poll the channel fd with a
@@ -596,17 +596,17 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
                             break;
                         }
                     }
-                    GGML_LOG_INFO("RDMA cm: addr resolved=%d\n", (int)addr_ev);
+                    GGML_LOG_DEBUG("RDMA cm: addr resolved=%d\n", (int)addr_ev);
                     if (addr_ev && rdma_resolve_route(cm_id, 2000) == 0) {
                         // wait for route
                         struct rdma_cm_event * rev = nullptr;
                         for (int w = 0; w < 100 && !resolved; w++) {
                             if (cm_wait(cm_channel, &rev, 50) == 0) {
-                                GGML_LOG_INFO("RDMA cm: route event=%d\n", (int)rev->event);
+                                GGML_LOG_DEBUG("RDMA cm: route event=%d\n", (int)rev->event);
                                 if (rev->event == RDMA_CM_EVENT_ROUTE_RESOLVED) {
                                     resolved = true;
                                     struct rdma_route * route = &cm_id->route;
-                                    GGML_LOG_INFO("RDMA cm: num_paths=%d\n", (int)route->num_paths);
+                                    GGML_LOG_DEBUG("RDMA cm: num_paths=%d\n", (int)route->num_paths);
                                     if (route->num_paths > 0) {
                                         struct ibv_sa_path_rec * path = &route->path_rec[0];
                                         // Find the local port + gid index whose GID matches the
@@ -684,7 +684,7 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
                                         if (ibv_modify_qp(rdma->qp, &rtr,
                                                 IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                                                 IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) == 0) {
-                                            GGML_LOG_ERROR("RDMA cm: RTR ok, transitioning to RTS [dgid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x sgid_idx=%d port=%u dlid=%d mtu=%d flow=%u]\n",
+                                            GGML_LOG_DEBUG("RDMA cm: RTR ok, transitioning to RTS [dgid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x sgid_idx=%d port=%u dlid=%d mtu=%d flow=%u]\n",
                                                            rtr.ah_attr.grh.dgid.raw[0], rtr.ah_attr.grh.dgid.raw[1], rtr.ah_attr.grh.dgid.raw[2], rtr.ah_attr.grh.dgid.raw[3],
                                                            rtr.ah_attr.grh.dgid.raw[4], rtr.ah_attr.grh.dgid.raw[5], rtr.ah_attr.grh.dgid.raw[6], rtr.ah_attr.grh.dgid.raw[7],
                                                            rtr.ah_attr.grh.dgid.raw[8], rtr.ah_attr.grh.dgid.raw[9], rtr.ah_attr.grh.dgid.raw[10], rtr.ah_attr.grh.dgid.raw[11],
@@ -1271,7 +1271,7 @@ static std::unique_ptr<rdma_conn> cm_make_conn(struct rdma_cm_id * id) {
 socket_ptr socket_t::connect_rdma(const char * host, int port) {
     struct timespec cts;
     clock_gettime(CLOCK_REALTIME, &cts);
-    GGML_LOG_ERROR("RDMA cm: connect attempt to %s:%d at %ld.%03ld\n",
+    GGML_LOG_DEBUG("RDMA cm: connect attempt to %s:%d at %ld.%03ld\n",
                    host, port, (long)cts.tv_sec, cts.tv_nsec / 1000000);
     auto impl = std::make_unique<socket_t::impl>((sockfd_t)-1);
     struct rdma_event_channel * ch = cm_create_channel_nb();

@@ -618,7 +618,7 @@ void rpc_dispatcher::work() {
 }
 
 rpc_dispatcher::~rpc_dispatcher() {
-    GGML_LOG_ERROR("RDMA cm: dispatcher for endpoint destroyed\n");
+    GGML_LOG_DEBUG("RDMA cm: dispatcher for endpoint destroyed\n");
     running = false;
     queue.interrupt();
     sock = nullptr;
@@ -745,6 +745,33 @@ static void ggml_backend_rpc_buffer_memset_tensor(
     ctx->dispatcher->send(RPC_CMD_MEMSET_TENSOR, request, sizeof(*request));
 }
 
+// Send a (possibly large) tensor as <=64MB set_tensor sub-requests.
+// Protocol-compatible: each sub-request carries | rpc_tensor | offset | data |,
+// with the offset advanced per chunk. Keeps per-request buffers small and
+// gives natural flow-control pauses at each RPC round-trip.
+static void send_set_tensor_chunked(std::shared_ptr<rpc_dispatcher> dispatcher, const rpc_tensor & rpc_tensor, const void * data, size_t offset, size_t size, bool async) {
+    constexpr size_t SET_TENSOR_CHUNK = 64 * 1024 * 1024;
+    size_t sent = 0;
+    while (sent < size) {
+        const size_t n = std::min(size - sent, SET_TENSOR_CHUNK);
+        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + n;
+        uint8_t * input = new uint8_t[input_size]();
+        memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
+        uint64_t off = offset + sent;
+        memcpy(input + sizeof(rpc_tensor), &off, sizeof(off));
+        memcpy(input + sizeof(rpc_tensor) + sizeof(offset), (const uint8_t *)data + sent, n);
+        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+        if (async) {
+            dispatcher->send_async(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+        } else {
+            dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+        }
+        sent += n;
+    }
+}
+
+
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
@@ -760,29 +787,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             return;
         }
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    //
-    // Large tensors are split into <=64MB sub-requests: one giant request
-    // (e.g. 1.35GB) requires a 1.35GB input buffer on BOTH sides, streams over
-    // RDMA for minutes without a protocol round-trip (starving the peer's RQ
-    // drain), and historically triggered RNR flushes + peer crashes. 64MB
-    // chunks keep per-request memory small, give natural flow-control pauses
-    // at each RPC round-trip, and each chunk lands in the peer's recv ring
-    // (<=64MB << 256MB ring).
-    constexpr size_t SET_TENSOR_CHUNK = 64 * 1024 * 1024;
-    size_t sent = 0;
-    while (sent < size) {
-        const size_t n = std::min(size - sent, SET_TENSOR_CHUNK);
-        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + n;
-        uint8_t * input = new uint8_t[input_size]();
-        memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
-        uint64_t off = offset + sent;
-        memcpy(input + sizeof(rpc_tensor), &off, sizeof(off));
-        memcpy(input + sizeof(rpc_tensor) + sizeof(offset), (const uint8_t *)data + sent, n);
-        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
-        sent += n;
-    }
+    // large tensors are split into <=64MB sub-requests (see send_set_tensor)
+    send_set_tensor_chunked(ctx->dispatcher, rpc_tensor, data, offset, size, false);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -1003,22 +1009,8 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
             return;
         }
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    // (split into <=64MB sub-requests — see ggml_backend_rpc_buffer_set_tensor)
-    constexpr size_t SET_TENSOR_CHUNK_ASYNC = 64 * 1024 * 1024;
-    size_t sent = 0;
-    while (sent < size) {
-        const size_t n = std::min(size - sent, SET_TENSOR_CHUNK_ASYNC);
-        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + n;
-        uint8_t * input = new uint8_t[input_size]();
-        memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
-        uint64_t off = offset + sent;
-        memcpy(input + sizeof(rpc_tensor), &off, sizeof(off));
-        memcpy(input + sizeof(rpc_tensor) + sizeof(offset), (const uint8_t *)data + sent, n);
-        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-        ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input_ptr, input_size);
-        sent += n;
-    }
+    // large tensors are split into <=64MB sub-requests
+    send_set_tensor_chunked(ctx->dispatcher, rpc_tensor, data, offset, size, true);
 }
 
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
