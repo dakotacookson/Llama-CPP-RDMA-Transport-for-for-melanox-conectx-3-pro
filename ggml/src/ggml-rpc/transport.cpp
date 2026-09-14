@@ -58,7 +58,8 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
 static struct rdma_event_channel * cm_create_channel_nb();
-static constexpr int    RDMA_RX_DEPTH = 1024;          // pre-posted recv ring: 1024 × 256 KiB = 256 MiB
+static constexpr int    RDMA_RX_DEPTH = 1024;
+static constexpr int    TX_RING_DEPTH  = 16;            // pipelined send buffers          // pre-posted recv ring: 1024 × 256 KiB = 256 MiB
 
 // Adaptive send pacing (credit-flow-control stand-in): if the peer's recv
 // drain lags our send progress by more than half the ring depth, back off
@@ -82,9 +83,14 @@ struct rdma_conn {
     // so the destructor must skip both.
     bool ctx_owned = true;
 
+    // TX ring: multiple buffers so rdma_send can pipeline posts without
+    // waiting for each completion (single buffer = lockstep, kills prefill)
+    // legacy single-buffer (non-CM raw path)
     void          * tx_buf = nullptr;
     struct ibv_mr * tx_mr  = nullptr;
-
+    void          * tx_bufs[TX_RING_DEPTH] = {};
+    struct ibv_mr * tx_mrs[TX_RING_DEPTH] = {};
+    int             tx_head = 0;
     void          * rx_buf = nullptr; // RDMA_RX_DEPTH × RDMA_CHUNK contiguous
     struct ibv_mr * rx_mr  = nullptr;
     int             rx_head = 0;
@@ -114,9 +120,11 @@ struct rdma_conn {
     }
 
     ~rdma_conn() {
-        if (tx_mr) ibv_dereg_mr(tx_mr);
+        for (int i = 0; i < TX_RING_DEPTH; i++) {
+            if (tx_mrs[i]) ibv_dereg_mr(tx_mrs[i]);
+            if (tx_bufs[i]) free(tx_bufs[i]);
+        }
         if (rx_mr) ibv_dereg_mr(rx_mr);
-        free(tx_buf);
         free(rx_buf);
         // QP destruction: in CM mode (ctx_owned=false) the QP belongs to the
         // cm_id and rdma_destroy_qp(cm_id) in the impl destructor owns it.
@@ -429,7 +437,7 @@ bool socket_t::impl::rdma_probe() {
     qia.send_cq = rdma->scq;
     qia.recv_cq = rdma->rcq;
     qia.qp_type = IBV_QPT_RC;
-    qia.cap.max_send_wr     = 4;
+    qia.cap.max_send_wr     = TX_RING_DEPTH + 4;
     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
     qia.cap.max_send_sge    = 1;
     qia.cap.max_recv_sge    = 1;
@@ -791,6 +799,9 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
     rdma_conn * c = rdma.get();
     const uint8_t * src = (const uint8_t *)data;
     size_t rem = size;
+    int pipelined = 0;  // chunks posted without waiting for completion
+    uint64_t spins = 0;
+
     while (rem > 0) {
         size_t chunk = std::min(rem, RDMA_CHUNK);
 
@@ -804,84 +815,90 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
             sge.addr   = (uintptr_t)src;
             sge.length = chunk;
             wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+            // inline: data copied into the WR at post time, no buffer needed
         } else {
-            memcpy(c->tx_buf, src, chunk);
-            sge.addr   = (uintptr_t)c->tx_buf;
+            // pipeline: use the next tx_buf in the ring (each chunk gets its own
+            // buffer, so multiple chunks can be in flight simultaneously)
+            memcpy(c->tx_bufs[c->tx_head], src, chunk);
+            sge.addr   = (uintptr_t)c->tx_bufs[c->tx_head];
             sge.length = chunk;
-            sge.lkey   = c->tx_mr->lkey;
+            sge.lkey   = c->tx_mrs[c->tx_head]->lkey;
             wr.send_flags = IBV_SEND_SIGNALED;
+            c->tx_head = (c->tx_head + 1) % TX_RING_DEPTH;
         }
 
         if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
         c->n_send_posted++;
-        struct ibv_wc wc;
-        // poll BOTH CQs while waiting for the send completion: the peer may be
-        // sending concurrently (full-duplex). If we only poll the SCQ, incoming
-        // SENDs consume our RQ slots and are never reposted until this send
-        // finishes — for a 191MB response the peer's RNR timer expires first
-        // and the QP dies (transport retry counter exceeded).
-        bool send_done = false, recv_progressed = false;
-        uint64_t spins = 0;
-        for (;;) {
-            int n = ibv_poll_cq(c->scq, 1, &wc);
-            if (n > 0) {
-                if (wc.opcode == IBV_WC_SEND) { send_done = true; break; }
-                if (wc.status != IBV_WC_SUCCESS) {
-                    GGML_LOG_ERROR("RDMA send CQ error: status=%d (%s)\n",
-                        wc.status, ibv_wc_status_str(wc.status));
-                    return false;
-                }
-                continue;
-            }
-            if (n < 0) return false;
-            // SCQ empty — check the RCQ once
-            struct ibv_wc rwc;
-            int rn = ibv_poll_cq(c->rcq, 1, &rwc);
-            if (rn > 0) {
-                if (rwc.status != IBV_WC_SUCCESS) {
-                    GGML_LOG_ERROR("RDMA recv CQ error during send: status=%d (%s)\n",
-                        rwc.status, ibv_wc_status_str(rwc.status));
-                    return false;
-                }
-                // repost the consumed recv slot
-                struct ibv_sge rsge = {};
-                rsge.addr   = (uintptr_t)c->rx_slot((int)rwc.wr_id);
-                rsge.length = RDMA_CHUNK;
-                rsge.lkey   = c->rx_mr->lkey;
-                struct ibv_recv_wr rwr = {}, * rbad = nullptr;
-                rwr.wr_id = rwc.wr_id; rwr.sg_list = &rsge; rwr.num_sge = 1;
-                if (ibv_post_recv(c->qp, &rwr, &rbad) != 0) return false;
-                c->n_recv_done++; c->n_recv_reposted++;
-                recv_progressed = true;
-                continue;
-            }
-            // nothing on either CQ — busy-spin briefly (latency-critical for
-            // decode's small RPCs), only sleep after ~2ms of pure spin
-            spins++;
-            if (spins > 20000) {
-                struct timespec ts = {0, 50000};
-                nanosleep(&ts, nullptr);
-            }
-            if (tcp_peer_closed()) return false;
-        }
-        c->n_send_done++;
-
         src += chunk;
         rem -= chunk;
 
-        // adaptive send pacing — BULK ONLY: applies to large streaming sends
-        // (tensor loads). Small chunks (decode RPCs, control messages) are
-        // latency-critical and skip pacing entirely. The delay also RESETS
-        // after any small send, so decode never inherits load-phase pacing.
-        if (chunk == RDMA_CHUNK && c->n_send_done % 1024 == 0 && size > 1024 * 1024) {
+        // poll the SCQ periodically to drain completions (non-blocking, don't
+        // wait — we're pipelining). Also poll RCQ to repost incoming recvs.
+        struct ibv_wc wc;
+        int n;
+        while ((n = ibv_poll_cq(c->scq, 1, &wc)) > 0) {
+            c->n_send_done++;
+            if (wc.status != IBV_WC_SUCCESS) {
+                GGML_LOG_ERROR("RDMA send CQ error: status=%d (%s)\n",
+                    wc.status, ibv_wc_status_str(wc.status));
+                return false;
+            }
+        }
+        if (n < 0) return false;
+        struct ibv_wc rwc;
+        while ((n = ibv_poll_cq(c->rcq, 1, &rwc)) > 0) {
+            if (rwc.status != IBV_WC_SUCCESS) {
+                GGML_LOG_ERROR("RDMA recv CQ error during send: status=%d (%s)\n",
+                    rwc.status, ibv_wc_status_str(rwc.status));
+                return false;
+            }
+            struct ibv_sge rsge = {};
+            rsge.addr   = (uintptr_t)c->rx_slot((int)rwc.wr_id);
+            rsge.length = RDMA_CHUNK;
+            rsge.lkey   = c->rx_mr->lkey;
+            struct ibv_recv_wr rwr = {}, * rbad = nullptr;
+            rwr.wr_id = rwc.wr_id; rwr.sg_list = &rsge; rwr.num_sge = 1;
+            if (ibv_post_recv(c->qp, &rwr, &rbad) != 0) return false;
+            c->n_recv_done++; c->n_recv_reposted++;
+        }
+        if (n < 0) return false;
+
+        // adaptive pacing — BULK ONLY: for large streaming, pause periodically
+        // to let the peer drain (prevents RNR). Small sends are latency-critical.
+        if (chunk == RDMA_CHUNK && c->n_send_posted % 1024 == 0 && size > 1024 * 1024) {
             struct timespec pz = {0, g_pacing_delay_us * 1000};
             nanosleep(&pz, nullptr);
             if (g_pacing_delay_us < PACING_MAX_US) {
                 g_pacing_delay_us = g_pacing_delay_us ? g_pacing_delay_us * 2 : PACING_MIN_US;
             }
         } else if (chunk < RDMA_CHUNK / 2) {
-            // small send completed fast — reset pacing so decode stays fast
             g_pacing_delay_us = PACING_MIN_US;
+        }
+    }
+    // drain remaining completions
+    struct ibv_wc wc;
+    while (c->n_send_done < c->n_send_posted) {
+        int n = ibv_poll_cq(c->scq, 1, &wc);
+        if (n > 0) {
+            c->n_send_done++;
+            if (wc.status != IBV_WC_SUCCESS) {
+                GGML_LOG_ERROR("RDMA send CQ error (drain): status=%d\n", wc.status);
+                return false;
+            }
+        } else if (n < 0) return false;
+        else {
+            struct ibv_wc rwc;
+            int rn = ibv_poll_cq(c->rcq, 1, &rwc);
+            if (rn > 0) {
+                struct ibv_sge rsge = {};
+                rsge.addr   = (uintptr_t)c->rx_slot((int)rwc.wr_id);
+                rsge.length = RDMA_CHUNK;
+                rsge.lkey   = c->rx_mr->lkey;
+                struct ibv_recv_wr rwr = {}, * rbad = nullptr;
+                rwr.wr_id = rwc.wr_id; rwr.sg_list = &rsge; rwr.num_sge = 1;
+                ibv_post_recv(c->qp, &rwr, &rbad);
+                c->n_recv_done++; c->n_recv_reposted++;
+            } else if (rn < 0) return false;
         }
     }
     return true;
@@ -1236,7 +1253,7 @@ static std::unique_ptr<rdma_conn> cm_make_conn(struct rdma_cm_id * id) {
     qia.send_cq = c->scq;
     qia.recv_cq = c->rcq;
     qia.qp_type = IBV_QPT_RC;
-    qia.cap.max_send_wr     = 4;
+    qia.cap.max_send_wr     = TX_RING_DEPTH + 4;
     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
     qia.cap.max_send_sge    = 1;
     qia.cap.max_recv_sge    = 1;
@@ -1255,13 +1272,17 @@ static std::unique_ptr<rdma_conn> cm_make_conn(struct rdma_cm_id * id) {
     }
     c->qp = id->qp;
     c->max_inline = qia.cap.max_inline_data;
-    c->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
+    for (int i = 0; i < TX_RING_DEPTH; i++) {
+        c->tx_bufs[i] = aligned_alloc(4096, RDMA_CHUNK);
+        if (!c->tx_bufs[i]) { GGML_LOG_ERROR("RDMA cm: tx aligned_alloc failed\n"); return nullptr; }
+        c->tx_mrs[i] = ibv_reg_mr(c->pd, c->tx_bufs[i], RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
+        if (!c->tx_mrs[i]) { GGML_LOG_ERROR("RDMA cm: tx ibv_reg_mr failed\n"); return nullptr; }
+    }
     c->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
-    if (!c->tx_buf || !c->rx_buf) { GGML_LOG_ERROR("RDMA cm: aligned_alloc failed\n"); return nullptr; }
-    c->tx_mr = ibv_reg_mr(c->pd, c->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
+    if (!c->rx_buf) { GGML_LOG_ERROR("RDMA cm: rx aligned_alloc failed\n"); return nullptr; }
     c->rx_mr = ibv_reg_mr(c->pd, c->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    if (!c->tx_mr || !c->rx_mr) { GGML_LOG_ERROR("RDMA cm: ibv_reg_mr failed: %s\n", strerror(errno)); return nullptr; }
+    if (!c->rx_mr) { GGML_LOG_ERROR("RDMA cm: rx ibv_reg_mr failed\n"); return nullptr; }
     for (int i = 0; i < RDMA_RX_DEPTH; i++) {
         if (!c->post_rx(i)) return nullptr;
     }
