@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -392,6 +393,19 @@ public:
         return true;
     }
 
+    // wait up to timeout_ms for a message; returns false on timeout/interrupt.
+    // Used by the dispatcher for RDMA keepalive between real requests.
+    bool pop_for(T* out, int timeout_ms) {
+        std::unique_lock<std::mutex> lock(mutex);
+        bool ready = cvar.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                   [this] { return !queue.empty() || interrupted; });
+        if (!ready) return false;      // timeout — no message, caller keeps waiting
+        if (interrupted) return false;
+        *out = queue.front();
+        queue.pop();
+        return true;
+    }
+
     void interrupt() {
         std::unique_lock<std::mutex> lock(mutex);
         interrupted = true;
@@ -596,11 +610,42 @@ void rpc_dispatcher::start(const std::string & endpoint) {
 }
 
 void rpc_dispatcher::work() {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE) && !defined(_WIN32)
+    // RDMA keepalive: the peer's poll loop drops idle connections after
+    // GGML_RDMA_POLL_TIMEOUT (default 30 min). Overnight/held models receive
+    // no traffic, so the connection dies. Send a lightweight RPC every
+    // 5 minutes to keep both QPs active — negligible cost, preserves models.
+    constexpr int QUEUE_WAIT_MS = 60000;   // 60s per pop cycle
+    constexpr int KEEPALIVE_INTERVAL_S = 300; // send heartbeat every 5 min
+    int idle_seconds = 0;
+#endif
     while (running) {
         rpc_msg_ptr msg_ptr;
-        if (!queue.pop(&msg_ptr)) {
-            break;
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE) && !defined(_WIN32)
+        bool have = queue.pop_for(&msg_ptr, QUEUE_WAIT_MS);
+        if (!have) {
+            if (!running) break;
+            idle_seconds += QUEUE_WAIT_MS / 1000;
+            if (idle_seconds >= KEEPALIVE_INTERVAL_S) {
+                // heartbeat: cheap RPC keeps the RDMA QP from idling out
+                std::unique_lock<std::mutex> dlock(direct_send_mutex);
+                try {
+                    rpc_msg_get_device_memory_req req = {};
+                    rpc_msg_get_device_memory_rsp rsp = {};
+                    bool ok = send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &req, sizeof(req), &rsp, sizeof(rsp));
+                    if (!ok) {
+                        GGML_LOG_ERROR("RDMA keepalive failed — peer connection lost, model may need reload\n");
+                    }
+                } catch (...) {}
+                idle_seconds = 0;
+            }
+            continue;
         }
+        idle_seconds = 0;
+#else
+        bool have = queue.pop(&msg_ptr);
+        if (!have) break;
+#endif
         if (msg_ptr->cmd != RPC_CMD_NONE) {
             // take the direct-send mutex: the calling thread may be direct-
             // sending synchronously; socket access must be serialized
