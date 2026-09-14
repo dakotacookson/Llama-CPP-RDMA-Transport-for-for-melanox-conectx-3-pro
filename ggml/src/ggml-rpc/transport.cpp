@@ -55,7 +55,8 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
-static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
+static constexpr int    RDMA_RX_DEPTH = 24;
+static constexpr int    RDMA_SEND_WINDOW = 8;  // bounded pipeline depth (<= RX_DEPTH)            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
 
 struct rdma_conn {
     struct ibv_context * ctx = nullptr;
@@ -64,8 +65,8 @@ struct rdma_conn {
     struct ibv_cq * rcq = nullptr;   // recv completions
     struct ibv_qp * qp  = nullptr;
 
-    void          * tx_buf = nullptr;
-    struct ibv_mr * tx_mr  = nullptr;
+    void          * tx_buf[RDMA_SEND_WINDOW] = {};
+    struct ibv_mr * tx_mr[RDMA_SEND_WINDOW]  = {};
 
     void          * rx_buf = nullptr; // RDMA_RX_DEPTH × RDMA_CHUNK contiguous
     struct ibv_mr * rx_mr  = nullptr;
@@ -90,9 +91,9 @@ struct rdma_conn {
     }
 
     ~rdma_conn() {
-        if (tx_mr) ibv_dereg_mr(tx_mr);
+        for (auto & m : tx_mr) if (m) ibv_dereg_mr(m);
         if (rx_mr) ibv_dereg_mr(rx_mr);
-        free(tx_buf);
+        for (auto & b : tx_buf) if (b) free(b);
         free(rx_buf);
         if (qp)  ibv_destroy_qp(qp);
         if (scq) ibv_destroy_cq(scq);
@@ -303,25 +304,41 @@ bool socket_t::impl::rdma_probe() {
                 continue;
             }
         } else {
-            // Explicit GID index from GGML_RDMA_GID — RoCEv2 ONLY. A pinned RoCEv1
-            // entry builds a raw-Ethernet AH while the peer's path is RoCEv2 (UDP/
-            // IP): ibv_modify_qp(RTR) fails or packets silently drop. Fail loudly.
+            // GGML_RDMA_GID hint: honor it if it's a valid RoCEv2 entry; otherwise
+            // (stale index after MTU/GID-table shifts, wrong type) fall through to
+            // auto-select — which is RoCEv2-only anyway. Never silently use a
+            // RoCEv1 entry: mismatched encapsulation drops packets silently.
             ibv_gid_entry entry = {};
-            if (ibv_query_gid_ex(ctx, ib_port, found_gid, &entry, 0) == 0) {
-                found_version = entry.gid_type;
-                if (entry.gid_type != IBV_GID_TYPE_ROCE_V2) {
-                    GGML_LOG_ERROR("RDMA probe: GGML_RDMA_GID=%d on %s is type=%s — "
-                                   "RoCEv2 required. Set GGML_RDMA_GID to a RoCEv2 GID index "
-                                   "(see probe log above).\n",
-                                   found_gid, rdma_gid_type_str(entry.gid_type));
+            if (ibv_query_gid_ex(ctx, ib_port, found_gid, &entry, 0) == 0 &&
+                entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
+                found_version = IBV_GID_TYPE_ROCE_V2;
+            } else {
+                GGML_LOG_INFO("RDMA probe: GGML_RDMA_GID=%d not a valid RoCEv2 entry on "
+                              "%s port %u — auto-selecting RoCEv2 GID by local address\n",
+                              found_gid, dn, ib_port);
+                found_gid = -1;  // force the auto-select branch below
+                int v2_idx = -1;
+                for (int i = 0; i < pa.gid_tbl_len; i++) {
+                    ibv_gid_entry e = {};
+                    if (ibv_query_gid_ex(ctx, ib_port, i, &e, 0) != 0) continue;
+                    if (e.gid_type == IBV_GID_TYPE_ROCE_V2) {
+                        GGML_LOG_INFO("RDMA probe: candidate GID[%d] %s\n", i,
+                                      rdma_gid_to_string(e.gid.raw).c_str());
+                        if (memcmp(e.gid.raw, target_gid->data(), RDMA_GID_SIZE) == 0) {
+                            v2_idx = i;
+                            break;
+                        }
+                    }
+                }
+                if (v2_idx >= 0) {
+                    found_gid = v2_idx;
+                    found_version = IBV_GID_TYPE_ROCE_V2;
+                } else {
+                    GGML_LOG_INFO("RDMA probe: device %s port %u: no RoCEv2 GID matches local addr, skipping\n",
+                                  dn, rdma_gid_to_string(target_gid->data()));
                     ibv_close_device(ctx);
                     continue;
                 }
-            } else {
-                GGML_LOG_ERROR("RDMA probe: GGML_RDMA_GID=%d not found on %s port %u\n",
-                               found_gid, dn, ib_port);
-                ibv_close_device(ctx);
-                continue;
             }
         }
         if (found_gid >= 0) {
@@ -338,6 +355,14 @@ bool socket_t::impl::rdma_probe() {
     }
     ibv_free_device_list(devs);
     if (!ibctx) return false;
+    // hard guarantee: RoCEv2 only, both sides, always — a mismatch here would build
+    // an AH/QP of the wrong encapsulation and silently drop packets
+    if (gid_version != IBV_GID_TYPE_ROCE_V2) {
+        GGML_LOG_ERROR("RDMA probe: selected GID %d on %s is not RoCEv2 (type=%d) — aborting probe\n",
+                       gid_idx, matched_dev, gid_version);
+        ibv_close_device(ibctx);
+        return false;
+    }
 
     rdma_local.ib_port = ib_port;
     rdma_local.gid_idx = gid_idx;
@@ -366,14 +391,18 @@ bool socket_t::impl::rdma_probe() {
     if (!rdma->qp) return false;
     rdma->max_inline = qia.cap.max_inline_data;
 
-    rdma->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
+    for (int i = 0; i < RDMA_SEND_WINDOW; i++) {
+        rdma->tx_buf[i] = aligned_alloc(4096, RDMA_CHUNK);
+        if (!rdma->tx_buf[i]) return false;
+        rdma->tx_mr[i] = ibv_reg_mr(rdma->pd, rdma->tx_buf[i], RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
+        if (!rdma->tx_mr[i]) return false;
+    }
     rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
-    if (!rdma->tx_buf || !rdma->rx_buf) return false;
+    if (!rdma->rx_buf) return false;
 
-    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
     rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    if (!rdma->tx_mr || !rdma->rx_mr) return false;
+    if (!rdma->rx_mr) return false;
 
     ibv_gid local_gid;
     if (ibv_query_gid(ibctx, ib_port, gid_idx, &local_gid) != 0) return false;
@@ -388,8 +417,9 @@ bool socket_t::impl::rdma_probe() {
     } else if (gid_version == IBV_GID_TYPE_ROCE_V1) {
         ver_str = " RoCEv1";
     }
-    GGML_LOG_INFO("RDMA probed: dev=%s gid=%d%s qpn=%u inline=%u\n",
-                  matched_dev, gid_idx, ver_str, rdma_local.qpn, rdma->max_inline);
+    GGML_LOG_INFO("RDMA probed: dev=%s gid=%d%s qpn=%u inline=%u mtu=%d (discovered from HCA)\n",
+                  matched_dev, gid_idx, ver_str, rdma_local.qpn, rdma->max_inline,
+                  128 << rdma_local.path_mtu);
     return true;
 }
 
@@ -488,6 +518,14 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
     rdma_conn * c = rdma.get();
     const uint8_t * src = (const uint8_t *)data;
     size_t rem = size;
+    int outstanding = 0;
+    uint64_t buf_idx = 0;
+    // bounded pipeline: up to RDMA_SEND_WINDOW sends in flight. RC delivery is
+    // ordered, so the peer's recv ring always sees chunks in post order; the recv
+    // ring (RDMA_RX_DEPTH=24) is deeper than the window (8), so RNR is impossible.
+    // Small sends stay inline+lockstep-ish: the window only opens up the wait for
+    // bulk transfers — semantics unchanged (every send completes; buffer reused
+    // only after its own completion).
     while (rem > 0) {
         size_t chunk = std::min(rem, RDMA_CHUNK);
 
@@ -497,24 +535,61 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
         wr.sg_list = &sge;
         wr.num_sge = 1;
 
-        if (chunk <= c->max_inline) {
+        const bool bulk = chunk > c->max_inline;
+        if (bulk) {
+            // window: before overwriting buffer[buf_idx % WINDOW] (in flight since
+            // WINDOW sends ago), drain completions until it (and all older) arrived
+            while (outstanding >= RDMA_SEND_WINDOW) {
+                struct ibv_wc wcd;
+                int n = ibv_poll_cq(c->scq, 1, &wcd);
+                if (n > 0) {
+                    if (wcd.status != IBV_WC_SUCCESS) {
+                        GGML_LOG_ERROR("RDMA send CQ error (window drain): status=%d\n", wcd.status);
+                        return false;
+                    }
+                    outstanding--;
+                } else if (n < 0) {
+                    return false;
+                } else {
+                    struct timespec ts = {0, 1000};  // 1µs spin
+                    nanosleep(&ts, nullptr);
+                }
+            }
+            const int bi = (int)(buf_idx % RDMA_SEND_WINDOW);
+            memcpy(c->tx_buf[bi], src, chunk);
+            sge.addr   = (uintptr_t)c->tx_buf[bi];
+            sge.length = chunk;
+            sge.lkey   = c->tx_mr[bi]->lkey;
+            wr.send_flags = IBV_SEND_SIGNALED;
+        } else {
             sge.addr   = (uintptr_t)src;
             sge.length = chunk;
             wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
-        } else {
-            memcpy(c->tx_buf, src, chunk);
-            sge.addr   = (uintptr_t)c->tx_buf;
-            sge.length = chunk;
-            sge.lkey   = c->tx_mr->lkey;
-            wr.send_flags = IBV_SEND_SIGNALED;
         }
 
         if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
-        struct ibv_wc wc;
-        if (!rdma_poll(c->scq, &wc)) return false;
+        outstanding++;           // every send is signaled — count it
+        if (bulk) buf_idx++;     // ring slot advances only for bulk (buffered) sends
 
         src += chunk;
         rem -= chunk;
+    }
+    // drain the tail
+    struct ibv_wc wc;
+    while (outstanding > 0) {
+        int n = ibv_poll_cq(c->scq, 1, &wc);
+        if (n > 0) {
+            if (wc.status != IBV_WC_SUCCESS) {
+                GGML_LOG_ERROR("RDMA send CQ error (tail): status=%d\n", wc.status);
+                return false;
+            }
+            outstanding--;
+        } else if (n < 0) {
+            return false;
+        } else {
+            struct timespec ts = {0, 1000};
+            nanosleep(&ts, nullptr);
+        }
     }
     return true;
 }
