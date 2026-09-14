@@ -54,7 +54,7 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 #endif // GGML_RPC_RDMA
 
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
-static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
+static constexpr size_t RDMA_CHUNK    = 1024 * 1024;  // 1 MiB: 4x fewer round trips per bulk tensor   // 256 KiB per send/recv (fits default 8 MiB memlock)
 static constexpr int    RDMA_RX_DEPTH = 24;
 static constexpr int    RDMA_SEND_WINDOW = 8;  // bounded pipeline depth (<= RX_DEPTH)            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
 
