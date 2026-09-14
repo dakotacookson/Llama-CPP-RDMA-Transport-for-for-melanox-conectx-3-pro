@@ -56,7 +56,8 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
 static constexpr size_t RDMA_CHUNK    = 1024 * 1024;  // 1 MiB: measured optimum (warm prefill tok/s: 512KB=554, 1MB=614, 2MB=537-603, 4MB=538-603)   // 256 KiB per send/recv (fits default 8 MiB memlock)
 static constexpr int    RDMA_RX_DEPTH = 24;
-static constexpr int    RDMA_SEND_WINDOW = 8;  // bounded pipeline depth (<= RX_DEPTH)            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
+static constexpr int    RDMA_SEND_WINDOW = 8;
+static constexpr int    RDMA_CQ_BATCH    = 8;   // poll up to 8 CQEs per call  // bounded pipeline depth (<= RX_DEPTH)            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
 
 struct rdma_conn {
     struct ibv_context * ctx = nullptr;
@@ -400,8 +401,12 @@ bool socket_t::impl::rdma_probe() {
     rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
     if (!rdma->rx_buf) return false;
 
+    // RELAXED_ORDERING: allow NIC out-of-order PCIe transactions — lower DMA latency
+    // (Perplexity TransferEngine enables it on ConnectX; safe: our buffers are
+    // single-writer, completion-gated before reuse)
     rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
-                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                           IBV_ACCESS_RELAXED_ORDERING);
     if (!rdma->rx_mr) return false;
 
     ibv_gid local_gid;
@@ -540,14 +545,16 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
             // window: before overwriting buffer[buf_idx % WINDOW] (in flight since
             // WINDOW sends ago), drain completions until it (and all older) arrived
             while (outstanding >= RDMA_SEND_WINDOW) {
-                struct ibv_wc wcd;
-                int n = ibv_poll_cq(c->scq, 1, &wcd);
+                struct ibv_wc wcq[RDMA_CQ_BATCH];
+                int n = ibv_poll_cq(c->scq, RDMA_CQ_BATCH, wcq);
                 if (n > 0) {
-                    if (wcd.status != IBV_WC_SUCCESS) {
-                        GGML_LOG_ERROR("RDMA send CQ error (window drain): status=%d\n", wcd.status);
-                        return false;
+                    for (int i = 0; i < n; i++) {
+                        if (wcq[i].status != IBV_WC_SUCCESS) {
+                            GGML_LOG_ERROR("RDMA send CQ error (window drain): status=%d\n", wcq[i].status);
+                            return false;
+                        }
+                        outstanding--;
                     }
-                    outstanding--;
                 } else if (n < 0) {
                     return false;
                 } else {
@@ -575,15 +582,17 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
         rem -= chunk;
     }
     // drain the tail
-    struct ibv_wc wc;
+    struct ibv_wc wcq[RDMA_CQ_BATCH];
     while (outstanding > 0) {
-        int n = ibv_poll_cq(c->scq, 1, &wc);
+        int n = ibv_poll_cq(c->scq, RDMA_CQ_BATCH, wcq);
         if (n > 0) {
-            if (wc.status != IBV_WC_SUCCESS) {
-                GGML_LOG_ERROR("RDMA send CQ error (tail): status=%d\n", wc.status);
-                return false;
+            for (int i = 0; i < n; i++) {
+                if (wcq[i].status != IBV_WC_SUCCESS) {
+                    GGML_LOG_ERROR("RDMA send CQ error (tail): status=%d\n", wcq[i].status);
+                    return false;
+                }
+                outstanding--;
             }
-            outstanding--;
         } else if (n < 0) {
             return false;
         } else {
