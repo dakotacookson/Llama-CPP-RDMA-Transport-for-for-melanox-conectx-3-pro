@@ -833,6 +833,14 @@ struct ggml_backend_sched {
 
     int debug;
 
+    // debug print sampling: print only every Nth graph (0/1 = every graph).
+    // GGML_SCHED_DEBUG_EVERY=N. Debug assignment printing walks every node
+    // with hash lookups and formatted logs INSIDE the compute path — on
+    // 27B-scale graphs (4000+ nodes) that costs more than the inference
+    // itself, so sampling keeps the visualizer fed without the slowdown.
+    int debug_every;
+    int debug_graph_count;
+
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
     int debug_realloc;
@@ -995,6 +1003,8 @@ static char * fmt_size(size_t size) {
 }
 
 static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    const bool dbg_detail = sched->debug_every <= 1 ||
+        sched->debug_graph_count % sched->debug_every == 0;
     int cur_split = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
         if (cur_split < sched->n_splits && i == sched->splits[cur_split].i_start) {
@@ -1015,7 +1025,7 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
         if (ggml_is_view_op(node->op)) {
             continue;
         }
-        if (sched->debug > 1) {
+        if (sched->debug > 1 && dbg_detail) {
             ggml_backend_t tensor_backend = ggml_backend_sched_get_tensor_backend(sched, node);
             GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
                 fmt_size(ggml_nbytes(node)), tensor_backend ? ggml_backend_name(tensor_backend) : "NULL", GET_CAUSE(node),
@@ -1425,6 +1435,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     if (sched->debug) {
+        if (sched->debug_every > 1) {
+            sched->debug_graph_count++;
+            if (sched->debug_graph_count % sched->debug_every) {
+                return;
+            }
+        }
         ggml_backend_sched_print_assignments(sched, graph);
     }
 
@@ -1857,6 +1873,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+    sched->debug_every = sched->debug > 0 ? 1 : 0;
+    sched->debug_graph_count = 0;
+    if (sched->debug > 0) {
+        const char * GGML_SCHED_DEBUG_EVERY = getenv("GGML_SCHED_DEBUG_EVERY");
+        if (GGML_SCHED_DEBUG_EVERY) {
+            int every = atoi(GGML_SCHED_DEBUG_EVERY);
+            sched->debug_every = every > 0 ? every : 1;
+        }
+    }
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
