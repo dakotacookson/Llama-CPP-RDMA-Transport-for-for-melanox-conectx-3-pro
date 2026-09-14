@@ -381,3 +381,15 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# native rdma_cm transport unit/integration test (needs ggml-rpc + RDMA build).
+# env-flag checks always run; the loopback ping-pong needs real RDMA hardware:
+#   GGML_RDMA_USE_CM=1 ./bin/test-rpc-rdma-cm <roce-ip> [port]
+if (TARGET ggml-rpc AND GGML_RPC_RDMA)
+    add_executable(test-rpc-rdma-cm test-rpc-rdma-cm.cpp)
+    target_link_libraries(test-rpc-rdma-cm PRIVATE ggml-rpc)
+    target_include_directories(test-rpc-rdma-cm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+    target_compile_definitions(test-rpc-rdma-cm PRIVATE GGML_RPC_RDMA)
+    add_test(NAME test-rpc-rdma-cm-flags COMMAND test-rpc-rdma-cm)
+    set_tests_properties(test-rpc-rdma-cm-flags PROPERTIES LABELS "rdma")
+endif()

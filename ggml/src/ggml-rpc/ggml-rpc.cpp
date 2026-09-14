@@ -308,6 +308,9 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
+    if (input_size > 100 * 1024 * 1024) {
+        GGML_LOG_ERROR("RPC cmd %d sending huge input: %zu bytes\n", (int)cmd, input_size);
+    }
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
     }
@@ -443,6 +446,7 @@ private:
     socket_ptr       sock;
     std::atomic_bool running;
     std::thread      thread;
+    std::mutex       direct_send_mutex;  // guards the direct-send fast path
 };
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
@@ -451,6 +455,21 @@ static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
 }
 
 void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+    // Fast path: when the dispatcher queue is idle (common during decode —
+    // one synchronous RPC at a time), send directly on the calling thread.
+    // This skips the queue-push + dispatcher-thread-wakeup + futex round trip
+    // (~100-200us per RPC). The dispatcher thread stays parked; its queue is
+    // only used for async traffic and contention cases.
+    {
+        std::unique_lock<std::mutex> dlock(direct_send_mutex);
+        if (!running || !sock) {
+            // dispatcher not ready — fall through to the queue path
+        } else {
+            bool status = send_rpc_cmd(sock, cmd, input.get(), input_size);
+            RPC_STATUS_ASSERT(status);
+            return;
+        }
+    }
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
     msg->input = input;
@@ -473,6 +492,16 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
 }
 
 void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+    // Fast path: direct send on the calling thread when dispatcher is idle
+    // (decode hot path — see the 3-arg send for rationale)
+    {
+        std::unique_lock<std::mutex> dlock(direct_send_mutex);
+        if (running && sock) {
+            bool status = send_rpc_cmd(sock, cmd, input.get(), input_size, output, output_size);
+            RPC_STATUS_ASSERT(status);
+            return;
+        }
+    }
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
     msg->input = input;
@@ -542,7 +571,19 @@ void rpc_dispatcher::start(const std::string & endpoint) {
         GGML_ABORT("RPC transport initialization failed\n");
     }
 
-    sock = socket_t::connect(host.c_str(), port);
+    // GGML_RDMA_USE_CM=1: native rdma_cm RC connection (no TCP socket at all).
+    // Otherwise: classic TCP connect with RDMA auto-negotiation.
+    bool use_cm = false;
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE) && !defined(_WIN32)
+    use_cm = rdma_cm_wanted();
+#endif
+    if (use_cm) {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE) && !defined(_WIN32)
+        sock = socket_t::connect_rdma(host.c_str(), port);
+#endif
+    } else {
+        sock = socket_t::connect(host.c_str(), port);
+    }
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
@@ -561,6 +602,9 @@ void rpc_dispatcher::work() {
             break;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
+            // take the direct-send mutex: the calling thread may be direct-
+            // sending synchronously; socket access must be serialized
+            std::unique_lock<std::mutex> dlock(direct_send_mutex);
             if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
@@ -574,6 +618,7 @@ void rpc_dispatcher::work() {
 }
 
 rpc_dispatcher::~rpc_dispatcher() {
+    GGML_LOG_ERROR("RDMA cm: dispatcher for endpoint destroyed\n");
     running = false;
     queue.interrupt();
     sock = nullptr;
@@ -585,13 +630,16 @@ rpc_dispatcher::~rpc_dispatcher() {
 static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<rpc_dispatcher>> dispatchers;
+    // NOTE: intentionally shared_ptr (not weak_ptr): dropping the last user
+    // reference between device-enumeration and backend-init destroys the
+    // dispatcher and its connection, forcing a reconnect the server may still
+    // be too busy to accept (it only notices the dead peer via timeout). One
+    // idle RC connection per endpoint is negligible and avoids the storm.
+    static std::unordered_map<std::string, std::shared_ptr<rpc_dispatcher>> dispatchers;
 
     auto it = dispatchers.find(endpoint);
     if (it != dispatchers.end()) {
-        if (auto dispatcher = it->second.lock()) {
-            return dispatcher;
-        }
+        return it->second;
     }
 
     auto dispatcher = std::make_shared<rpc_dispatcher>();
@@ -713,13 +761,28 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         }
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    uint8_t * input = new uint8_t[input_size]();
-    memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+    //
+    // Large tensors are split into <=64MB sub-requests: one giant request
+    // (e.g. 1.35GB) requires a 1.35GB input buffer on BOTH sides, streams over
+    // RDMA for minutes without a protocol round-trip (starving the peer's RQ
+    // drain), and historically triggered RNR flushes + peer crashes. 64MB
+    // chunks keep per-request memory small, give natural flow-control pauses
+    // at each RPC round-trip, and each chunk lands in the peer's recv ring
+    // (<=64MB << 256MB ring).
+    constexpr size_t SET_TENSOR_CHUNK = 64 * 1024 * 1024;
+    size_t sent = 0;
+    while (sent < size) {
+        const size_t n = std::min(size - sent, SET_TENSOR_CHUNK);
+        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + n;
+        uint8_t * input = new uint8_t[input_size]();
+        memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
+        uint64_t off = offset + sent;
+        memcpy(input + sizeof(rpc_tensor), &off, sizeof(off));
+        memcpy(input + sizeof(rpc_tensor) + sizeof(offset), (const uint8_t *)data + sent, n);
+        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+        sent += n;
+    }
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -941,13 +1004,21 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
         }
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    uint8_t * input = new uint8_t[input_size]();
-    memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+    // (split into <=64MB sub-requests — see ggml_backend_rpc_buffer_set_tensor)
+    constexpr size_t SET_TENSOR_CHUNK_ASYNC = 64 * 1024 * 1024;
+    size_t sent = 0;
+    while (sent < size) {
+        const size_t n = std::min(size - sent, SET_TENSOR_CHUNK_ASYNC);
+        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + n;
+        uint8_t * input = new uint8_t[input_size]();
+        memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
+        uint64_t off = offset + sent;
+        memcpy(input + sizeof(rpc_tensor), &off, sizeof(off));
+        memcpy(input + sizeof(rpc_tensor) + sizeof(offset), (const uint8_t *)data + sent, n);
+        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+        ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+        sent += n;
+    }
 }
 
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2105,6 +2176,35 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to initialize RPC transport\n");
         return;
     }
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE) && !defined(_WIN32)
+    if (rdma_cm_wanted()) {
+        // Native rdma_cm server: RC connections only, no TCP socket exists.
+        printf("  transport      : native RDMA (rdma_cm, no TCP)\n");
+        fflush(stdout);
+        auto listener = rdma_cm_listen(host.c_str(), port);
+        if (listener == nullptr) {
+            fprintf(stderr, "Failed to create rdma_cm listener\n");
+            return;
+        }
+        while (true) {
+            static int cm_conn_no = 0;
+            cm_conn_no++;
+            auto client_socket = rdma_cm_accept(listener);
+            if (client_socket == nullptr) {
+                printf("RDMA accept attempt #%d failed, waiting for next\n", cm_conn_no);
+                fflush(stdout);
+                continue;  // accept timeout: loop and wait for a client
+            }
+            printf("Accepted client connection (RDMA) #%d\n", cm_conn_no);
+            fflush(stdout);
+            rpc_serve_client(backends, cache_dir, client_socket);
+            printf("Client connection closed\n");
+            fflush(stdout);
+        }
+        rdma_cm_close(listener);
+        return;
+    }
+#endif
     auto server_socket = socket_t::create_server(host.c_str(), port);
     if (server_socket == nullptr) {
         fprintf(stderr, "Failed to create server socket\n");
