@@ -85,6 +85,8 @@ struct rdma_conn {
 
     // TX ring: multiple buffers so rdma_send can pipeline posts without
     // waiting for each completion (single buffer = lockstep, kills prefill)
+    // tx_outstanding: sends posted but not yet completed (for ring-wrap safety)
+    uint64_t tx_outstanding = 0;
     // legacy single-buffer (non-CM raw path)
     void          * tx_buf = nullptr;
     struct ibv_mr * tx_mr  = nullptr;
@@ -827,8 +829,35 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
             c->tx_head = (c->tx_head + 1) % TX_RING_DEPTH;
         }
 
+        // ring-wrap safety: if all TX_RING_DEPTH buffers are outstanding,
+        // drain completions until at least one tx_buf is free before
+        // overwriting it (otherwise we corrupt in-flight data)
+        if (c->tx_outstanding >= TX_RING_DEPTH) {
+            struct ibv_wc wc_drain;
+            int n_drain;
+            while (c->tx_outstanding > 0) {
+                n_drain = ibv_poll_cq(c->scq, 1, &wc_drain);
+                if (n_drain > 0) {
+                    c->n_send_done++;
+                    c->tx_outstanding--;
+                    if (wc_drain.status != IBV_WC_SUCCESS) {
+                        GGML_LOG_ERROR("RDMA send CQ error (drain): status=%d\n", wc_drain.status);
+                        return false;
+                    }
+                } else if (n_drain < 0) {
+                    return false;
+                } else {
+                    struct timespec ts = {0, 1000}; // 1µs spin
+                    nanosleep(&ts, nullptr);
+                }
+            }
+            pipelined = 0;
+        }
+
         if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
         c->n_send_posted++;
+        c->tx_outstanding++;
+        pipelined++;  // count for ring-wrap check (checked at top of next iteration)
         src += chunk;
         rem -= chunk;
 
@@ -881,6 +910,7 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
         int n = ibv_poll_cq(c->scq, 1, &wc);
         if (n > 0) {
             c->n_send_done++;
+            c->tx_outstanding--;
             if (wc.status != IBV_WC_SUCCESS) {
                 GGML_LOG_ERROR("RDMA send CQ error (drain): status=%d\n", wc.status);
                 return false;
